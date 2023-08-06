@@ -7,12 +7,15 @@
 #include <libpostproc/postprocess.h>
 #include <libavutil/fifo.h>
 #include <libavutil/ffversion.h>
+#include <libavutil/time.h>
 #include <libavcodec/avfft.h>
 #include <libavdevice/avdevice.h>
 #include <libavutil/macros.h>
 #include <libavutil/avstring.h>
 #include <SDL/SDL.h>
 #include <SDL/SDL_thread.h>
+
+#include <signal.h>
 
 #include "cmdutils.h"
 #include "opt_common.h"
@@ -21,6 +24,11 @@ const char program_name[] = "ffplay";
 const int program_birth_year = 2003;
 
 #define SAMPLE_ARRAY_SIZE (8 * 65536)
+
+#define CURSOR_HIDE_DELAY 1000000
+
+/* polls for possible required screen refresh at least this often, should be less than 1/fps */
+#define REFRESH_RATE 0.01
 
 #define VIDEO_PICTURE_QUEUE_SIZE 3
 #define SUBPICTURE_QUEUE_SIZE 16
@@ -263,6 +271,37 @@ static int filter_nbthreads = 0;
 static int is_full_screen;
 static int64_t audio_callback_time;
 
+#define FF_QUIT_EVENT (SDL_USEREVENT + 2)
+static SDL_Window *window;
+static SDL_Renderer *renderer;
+static SDL_RendererInfo renderer_info = {0};
+static SDL_AudioDeviceID audio_dev;
+
+static const struct TextureFormatEntry {
+    enum AVPixelFormat format;
+    int texture_fmt;
+} sdl_texture_format_map[] = {
+    { AV_PIX_FMT_RGB8,           SDL_PIXELFORMAT_RGB332 },
+    { AV_PIX_FMT_RGB444,         SDL_PIXELFORMAT_RGB444 },
+    { AV_PIX_FMT_RGB555,         SDL_PIXELFORMAT_RGB555 },
+    { AV_PIX_FMT_BGR555,         SDL_PIXELFORMAT_BGR555 },
+    { AV_PIX_FMT_RGB565,         SDL_PIXELFORMAT_RGB565 },
+    { AV_PIX_FMT_BGR565,         SDL_PIXELFORMAT_BGR565 },
+    { AV_PIX_FMT_RGB24,          SDL_PIXELFORMAT_RGB24 },
+    { AV_PIX_FMT_BGR24,          SDL_PIXELFORMAT_BGR24 },
+    { AV_PIX_FMT_0RGB32,         SDL_PIXELFORMAT_RGB888 },
+    { AV_PIX_FMT_0BGR32,         SDL_PIXELFORMAT_BGR888 },
+    { AV_PIX_FMT_NE(RGB0, 0BGR), SDL_PIXELFORMAT_RGBX8888 },
+    { AV_PIX_FMT_NE(BGR0, 0RGB), SDL_PIXELFORMAT_BGRX8888 },
+    { AV_PIX_FMT_RGB32,          SDL_PIXELFORMAT_ARGB8888 },
+    { AV_PIX_FMT_RGB32_1,        SDL_PIXELFORMAT_RGBA8888 },
+    { AV_PIX_FMT_BGR32,          SDL_PIXELFORMAT_ABGR8888 },
+    { AV_PIX_FMT_BGR32_1,        SDL_PIXELFORMAT_BGRA8888 },
+    { AV_PIX_FMT_YUV420P,        SDL_PIXELFORMAT_IYUV },
+    { AV_PIX_FMT_YUYV422,        SDL_PIXELFORMAT_YUY2 },
+    { AV_PIX_FMT_UYVY422,        SDL_PIXELFORMAT_UYVY },
+    { AV_PIX_FMT_NONE,           SDL_PIXELFORMAT_UNKNOWN },
+    };
 
 static const OptionDef *find_option(const OptionDef *po, const char *name)
 {
@@ -541,13 +580,632 @@ void show_help_default(const char *opt, const char *arg)
            );
 }
 
+static int packet_queue_put_private(PacketQueue *q, AVPacket *pkt)
+{
+    MyAVPacketList pkt1;
+    int ret;
+
+    if (q->abort_request)
+            return -1;
+
+    pkt1.pkt = pkt;
+    pkt1.serial = q->serial;
+
+    ret = av_fifo_write(q->pkt_list, &pkt1, 1);
+    if (ret < 0)
+            return ret;
+
+    q->nb_packets++;
+    q->size += pkt1.pkt->size + sizeof(pkt1);
+    q->duration += pkt1.pkt->duration;
+
+    SDL_CondSignal(q->cond);
+    return 0;
+}
+
+static int packet_queue_put(PacketQueue *q, AVPacket *pkt)
+{
+    AVPacket *pkt1;
+    int ret;
+
+    pkt1 = av_packet_alloc();
+    if (!pkt1)
+    {
+            av_packet_unref(pkt);
+            return -1;
+    }
+    av_packet_move_ref(pkt1, pkt);
+
+    SDL_LockMutex(q->mutex);
+    ret = packet_queue_put_private(q, pkt1);
+    SDL_UnlockMutex(q->mutex);
+
+    if (ret < 0)
+            av_packet_free(&pkt1);
+
+    return ret;
+}
+
+static int packet_queue_put_nullpacket(PacketQueue *q, AVPacket *pkt, int stream_index)
+{
+    pkt->stream_index = stream_index;
+    return packet_queue_put(q, pkt);
+}
+
+static int packet_queue_init(PacketQueue *q)
+{
+    memset(q, 0, sizeof(PacketQueue));
+    q->pkt_list = av_fifo_alloc2(1, sizeof(MyAVPacketList), AV_FIFO_FLAG_AUTO_GROW);
+    if (!q->pkt_list)
+            return AVERROR(ENOMEM);
+    q->mutex = SDL_CreateMutex();
+    if (!q->mutex)
+    {
+            av_log(NULL, AV_LOG_FATAL, "SDL_CreateMutex(): %s\n", SDL_GetError());
+            return AVERROR(ENOMEM);
+    }
+
+    q->cond = SDL_CreateCond();
+    if (!q->cond)
+    {
+            av_log(NULL, AV_LOG_FATAL, "SDL_CreateCond(): %s\n", SDL_GetError());
+            return AVERROR(ENOMEM);
+    }
+    q->abort_request = 1;
+    return 0;
+}
+
+static void stream_close(VideoState *is)
+{
+
+}
+
+static void do_exit(VideoState *is)
+{
+    if (is) {
+            stream_close(is);
+    }
+    if (renderer)
+            SDL_DestroyRenderer(renderer);
+    if (window)
+            SDL_DestroyWindow(window);
+    uninit_opts();
+    av_freep(&vfilters_list);
+    avformat_network_deinit();
+    if (show_status)
+            printf("\n");
+    SDL_Quit();
+    av_log(NULL, AV_LOG_QUIET, "%s", "");
+    exit(0);
+}
+
+static void packet_queue_flush(PacketQueue *q)
+{
+    MyAVPacketList pkt1;
+
+    SDL_LockMutex(q->mutex);
+    while (av_fifo_read(q->pkt_list, &pkt1, 1))
+            av_packet_free(&pkt1.pkt);
+    q->nb_packets = 0;
+    q->size = 0;
+    q->duration = 0;
+    q->serial++;
+    SDL_UnlockMutex(q->mutex);
+}
+
+static void pakcet_queue_destroy(PacketQueue *q)
+{
+    packet_queue_flush(q);
+    av_fifo_freep2(&q->pkt_list);
+    SDL_DestroyMutex(q->mutex);
+    SDL_DestroyCond(q->cond);
+}
+
+static void packet_queue_abort(PacketQueue *q)
+{
+    SDL_LockMutex(q->mutex);
+    q->abort_request = 1;
+    SDL_CondSignal(q->cond);
+    SDL_UnlockMutex(q->mutex);
+}
+
+static void packet_queue_start(PacketQueue *q)
+{
+    SDL_LockMutex(q->mutex);
+    q->abort_request = 0;
+    q->serial++;
+    SDL_UnlockMutex(q->mutex);
+}
+
+static int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block, int *serial)
+{
+    MyAVPacketList pkt1;
+    int ret;
+
+    SDL_LockMutex(q->mutex);
+
+    for (;;)
+    {
+            if (q->abort_request)
+            {
+            ret = -1;
+            break;
+            }
+
+            if (av_fifo_read(q->pkt_list, &pkt1, 1) >= 0)
+            {
+            q->nb_packets--;
+            q->size -= pkt1.pkt->size + sizeof(MyAVPacketList);
+            q->duration -= pkt1.pkt->duration;
+            av_packet_move_ref(pkt, pkt1.pkt);
+            if (serial)
+                *serial = pkt1.serial;
+            av_packet_free(&pkt1.pkt);
+            ret = 1;
+            break;
+            }
+            else if (!block)
+            {
+            ret = 0;
+            break;
+            }
+            else
+            {
+            SDL_CondWait(q->cond, q->mutex);
+            }
+    }
+
+    SDL_UnlockMutex(q->mutex);
+    return ret;
+}
+
+static void frame_queue_unref_item(Frame *vp)
+{
+    av_frame_unref(vp->frame);
+    avsubtitle_free(&vp->sub);
+}
+
+static int frame_queue_init(FrameQueue *f, PacketQueue *pktq, int max_size, int keep_last)
+{
+    int i;
+    memset(f, 0, sizeof(FrameQueue));
+    if (!(f->mutex = SDL_CreateMutex()))
+    {
+            av_log(NULL, AV_LOG_FATAL, "SDL_CreateMutex(): %s\n", SDL_GetError());
+            return AVERROR(ENOMEM);
+    }
+    if (!(f->cond = SDL_CreateCond()))
+    {
+            av_log(NULL, AV_LOG_FATAL, "SDL_CreateCond(): %s\n", SDL_GetError());
+            return AVERROR(ENOMEM);
+    }
+    f->pktq = pktq;
+    f->max_size = FFMIN(max_size, FRAME_QUEUE_SIZE);
+    f->keep_last = !!keep_last;
+    for (i = 0; i < f->max_size; ++i)
+            if (!(f->queue[i].frame = av_frame_alloc()))
+              return AVERROR(ENOMEM);
+
+    return 0;
+}
+
+static void frame_queue_destroy(FrameQueue *f)
+{
+    int i;
+    for (i = 0; i < f->size; ++i)
+    {
+            Frame *vp = &f->queue[i];
+            frame_queue_unref_item(vp);
+            av_frame_free(&vp->frame);
+    }
+
+    SDL_DestroyMutex(f->mutex);
+    SDL_DestroyCond(f->cond);
+}
+
+static void frame_queue_signal(FrameQueue *f)
+{
+    SDL_LockMutex(f->mutex);
+    SDL_CondSignal(f->cond);
+    SDL_UnlockMutex(f->mutex);
+}
+
+static Frame* frame_queue_peek(FrameQueue *f)
+{
+    return &f->queue[(f->rindex + f->rindex_shown) % f->max_size];
+}
+
+static Frame* frame_queue_peek_next(FrameQueue *f)
+{
+    return &f->queue[(f->rindex + f->rindex_shown + 1) % f->max_size];
+}
+
+static Frame* frame_queue_peek_last(FrameQueue *f)
+{
+    return &f->queue[f->rindex];
+}
+
+static Frame* frame_queue_peek_writable(FrameQueue *f)
+{
+    SDL_LockMutex(f->mutex);
+    while (f->size >= f->max_size && !f->pktq->abort_request) {
+            SDL_CondWait(f->cond, f->mutex);
+    }
+    SDL_UnlockMutex(f->mutex);
+
+    if (f->pktq->abort_request)
+            return NULL;
+
+    return &f->queue[f->windex];
+}
+
+static Frame* frame_queue_peek_readable(FrameQueue *f)
+{
+    SDL_LockMutex(f->mutex);
+    while (f->size - f->rindex_shown <= 0 && !f->pktq->abort_request)
+            SDL_CondWait(f->cond, f->mutex);
+    SDL_UnlockMutex(f->mutex);
+
+    if (f->pktq->abort_request)
+            return NULL;
+
+    return &f->queue[(f->rindex + f->rindex_shown) % f->max_size];
+}
+
+static void frame_queue_push(FrameQueue *f)
+{
+    if (++f->windex == f->max_size)
+            f->windex = 0;
+
+    SDL_LockMutex(f->mutex);
+    f->size++;
+    SDL_CondSignal(f->cond);
+    SDL_UnlockMutex(f->mutex);
+}
+
+static void frame_queue_next(FrameQueue *f)
+{
+    if (f->keep_last && !f->rindex_shown)
+    {
+            f->rindex_shown = 1;
+            return;
+    }
+
+    frame_queue_unref_item(&f->queue[f->rindex]);
+    if (++f->rindex == f->max_size)
+            f->rindex = 0;
+
+    SDL_LockMutex(f->mutex);
+    f->size--;
+    SDL_CondSignal(f->cond);
+    SDL_UnlockMutex(f->mutex);
+}
+
+static int64_t frame_queue_last_pos(FrameQueue *f)
+{
+    Frame *fp = &f->queue[f->rindex];
+    if (f->rindex_shown && fp->serial == f->pktq->serial)
+            return fp->pos;
+    else
+            return -1;
+}
+
+static int frame_queue_nb_remaining(FrameQueue *f)
+{
+    return f->size - f->rindex_shown;
+}
+
+static void sigterm_handler(int sig)
+{
+    exit(123);
+}
+
+static double get_clock(Clock *c)
+{
+    if (*c->queue_serial != c->serial)
+            return NAN;
+    if (c->paused)
+            return c->pts;
+    else
+    {
+            double time = av_gettime_relative() / 1000000.0;
+            return c->pts_drift + time - (time - c->last_updated) * (1.0 - c->speed);
+    }
+}
+
+static void set_clock_at(Clock *c, double pts, int serial, double time)
+{
+    c->pts = pts;
+    c->last_updated = time;
+    c->pts_drift = c->pts - time;
+    c->serial = serial;
+}
+
+static void set_clock(Clock *c, double pts, int serial)
+{
+    double time = av_gettime_relative() / 1000000.0;
+    set_clock_at(c, pts, serial, time);
+}
+
+static void set_clock_speed(Clock *c, double speed)
+{
+    set_clock(c, get_clock(c), c->serial);
+    c->speed = speed;
+}
+
+static void init_clock(Clock *c, int *queue_serial)
+{
+    c->speed = 1.0;
+    c->paused = 0;
+    c->queue_serial = queue_serial;
+    set_clock(c, NAN, -1);
+}
+
+static int read_thread(void *arg)
+{
+
+}
+
+static VideoState* stream_open(const char *filename, const AVInputFormat *iformat)
+{
+    VideoState *is;
+
+    is = av_mallocz(sizeof(VideoState));
+    if (!is)
+            return NULL;
+    is->last_video_stream = is->video_stream = -1;
+    is->last_subtitle_stream = is->subtitle_stream = -1;
+    is->last_audio_stream = is->audio_stream = -1;
+    is->filename = av_strdup(filename);
+    if (!is->filename)
+            goto fail;
+
+    is->iformat = iformat;
+    is->xleft = 0;
+    is->ytop = 0;
+
+    if (frame_queue_init(&is->pictq, &is->videoq, VIDEO_PICTURE_QUEUE_SIZE, 1) < 0)
+            goto fail;
+    if (frame_queue_init(&is->subq, &is->subtitileq, SUBPICTURE_QUEUE_SIZE, 0) < 0)
+            goto fail;
+    if (frame_queue_init(&is->subq, &is->audioq, SAMPLE_QUEUE_SIZE, 1) < 0)
+            goto fail;
+
+    if (packet_queue_init(&is->videoq) < 0 || packet_queue_init(&is->subtitileq) < 0 || packet_queue_init(&is->audioq) < 0)
+            goto fail;
+
+    if (!(is->continue_read_thread = SDL_CreateCond()))
+    {
+            av_log(NULL, AV_LOG_FATAL, "SDL_CreateCond(): %s\n", SDL_GetError());
+            goto fail;
+    }
+
+    init_clock(&is->vidclk, &is->videoq.serial);
+    init_clock(&is->audclk, &is->audioq.serial);
+    init_clock(&is->extclk, &is->extclk.serial);
+    is->audio_clock_serial = -1;
+    if (startup_volume < 0)
+            av_log(NULL, AV_LOG_WARNING, "-volume=%d < 0, setting to 0\n", startup_volume);
+    if (startup_volume > 100)
+            av_log(NULL, AV_LOG_WARNING, "-volume=%d > 100, setting to 100\n", startup_volume);
+    startup_volume = av_clip(startup_volume, 0, 100);
+    startup_volume = av_clip(SDL_MIX_MAXVOLUME * startup_volume / 100, 0, SDL_MIX_MAXVOLUME);
+    is->audio_volume = startup_volume;
+    is->muted = 0;
+    is->av_sync_type = av_sync_type;
+    is->read_tid = SDL_CreateThread(read_thread, "read_thread", is);
+    if (!is->read_tid)
+    {
+            av_log(NULL, AV_LOG_FATAL, "SDL_CreateThread(): %s\n", SDL_GetError());
+    fail:
+            stream_close(is);
+            return NULL;
+    }
+
+    return is;
+}
+
+static void video_open(VideoState *is)
+{
+    int w, h;
+    w = screen_width ? screen_width : default_width;
+    h = screen_height ? screen_height : default_height;
+
+    if (!window_title)
+            window_title = input_filename;
+    SDL_SetWindowTitle(window, window_title);
+
+    SDL_SetWindowSize(window, w, h);
+    SDL_SetWindowPosition(window, screen_left, screen_top);
+    if (is_full_screen)
+            SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
+    SDL_ShowWindow(window);
+
+    is->width = w;
+    is->height = h;
+}
+
+static void video_audio_display(VideoState *is)
+{
+
+}
+
+static void video_image_display(VideoState *is)
+{
+
+}
+
+static void video_display(VideoState *is)
+{
+    if (!is->width)
+            video_open(is);
+
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+    SDL_RenderClear(renderer);
+    if (is->audio_st && is->show_mode != SHOW_MODE_VIDEO)
+            video_audio_display(is);
+    else if (is->video_st)
+            video_image_display(is);
+    SDL_RenderPresent(renderer);
+}
+
+static void video_refresh(void *opaque, double *remaining_time)
+{
+    VideoState *is = opaque;
+    double time;
+    video_display(is);
+}
+
+static void refresh_loop_wait_event(VideoState *is, SDL_Event *event)
+{
+    double remaining_time = 0.0;
+    SDL_PumpEvents();
+    while (!SDL_PeepEvents(event, 1, SDL_GETEVENT, SDL_FIRSTEVENT, SDL_LASTEVENT))
+    {
+            if (!cursor_hidden && av_gettime_relative() - cursor_last_shown > CURSOR_HIDE_DELAY)
+            {
+            SDL_ShowCursor(0);
+            cursor_hidden = 1;
+            }
+
+            if (remaining_time > 0.0)
+               av_usleep((int64_t)(remaining_time * 1000000.0));
+            remaining_time = REFRESH_RATE;
+            if (is->show_mode != SHOW_MODE_NONE && (!is->paused || is->force_refresh))
+               video_refresh(is, &remaining_time);
+            SDL_PumpEvents();
+    }
+}
+
+static void event_loop(VideoState *cur_stream)
+{
+    SDL_Event event;
+    double incr, pos, frac;
+
+    for (;;)
+    {
+            double x;
+            refresh_loop_wait_event(cur_stream, &event);
+            switch (event.type) {
+            default:
+               break;
+            }
+    }
+}
+
 int main(int argc, char *argv[])
 {
     int flags;
     VideoState *is;
+
+    init_dynload();
+
     av_log_set_flags(AV_LOG_SKIP_REPEATED);
+    parse_loglevel(argc, argv, options);
+
     avdevice_register_all();
     avformat_network_init();
+
+    signal(SIGINT, sigterm_handler);
+    signal(SIGTERM, sigterm_handler);
+
     show_banner(argc, argv, options);
+
+    parse_options(NULL, argc, argv, options, opt_input_file);
+
+    if (!input_filename)
+    {
+            show_usage();
+            av_log(NULL, AV_LOG_FATAL, "An input file must be specified\n");
+            av_log(NULL, AV_LOG_FATAL,
+                   "Use -h to get full help or, even better, run 'man %s'\n", program_name);
+            exit(1);
+    }
+
+    printf("filename: %s\n", input_filename);
+
+    if (display_disable)
+    {
+            video_disable = 1;
+    }
+
+    flags = SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER;
+    if (audio_disable)
+    {
+            flags &= ~SDL_INIT_AUDIO;
+    }
+    else
+    {
+            if (!SDL_getenv("SDL_AUDIO_ALSA_SET_BUFFER_SIZE"))
+            SDL_setenv("SDL_AUDIO_ALSA_SET_BUFFER_SIZE","1", 1);
+    }
+
+    if (video_disable)
+    {
+            flags &= ~SDL_INIT_VIDEO;
+    }
+
+    if (SDL_Init(flags))
+    {
+            av_log(NULL, AV_LOG_FATAL, "Could not initialize SDL - %s\n", SDL_GetError());
+            av_log(NULL, AV_LOG_FATAL, "(Did you set the DISPLAY variable?)\n");
+            exit(1);
+    }
+
+    SDL_EventState(SDL_SYSWMEVENT, SDL_IGNORE);
+    SDL_EventState(SDL_USEREVENT, SDL_IGNORE);
+
+    if (!display_disable)
+    {
+            int flags = SDL_WINDOW_HIDDEN;
+            if (alwaysontop)
+
+#if SDL_VERSION_ATLEAST(2, 0, 5)
+            flags  |= SDL_WINDOW_ALWAYS_ON_TOP;
+#else
+            av_log(NULL, AV_LOG_WARNING, "Your SDL version doesn't support SDL_WINDOW_ALWAYS_ON_TOP. Feature will be inactive.\n");
+#endif
+            if (borderless)
+            flags |= SDL_WINDOW_BORDERLESS;
+            else
+            flags |= SDL_WINDOW_RESIZABLE;
+
+#ifdef SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR
+            SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
+#endif
+
+            window = SDL_CreateWindow(program_name, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, default_width, default_height, flags);
+            SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
+            if (window)
+            {
+            renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+            if (!renderer)
+            {
+                av_log(NULL, AV_LOG_WARNING, "Failed to initialize a hardware accelerated renderer: %s\n", SDL_GetError());
+                renderer = SDL_CreateRenderer(window, -1, 0);
+            }
+            if (renderer)
+            {
+                if (!SDL_GetRendererInfo(renderer, &renderer_info))
+                    av_log(NULL, AV_LOG_VERBOSE, "Initialized %s renderer.\n", renderer_info.name);
+            }
+            }
+            if (!window || !renderer || !renderer_info.num_texture_formats)
+            {
+            av_log(NULL, AV_LOG_FATAL, "Failed to create window or renderer: %s", SDL_GetError());
+            do_exit(NULL);
+            }
+
+    }
+
+    is = stream_open(input_filename, file_iformat);
+    if (!is)
+    {
+            av_log(NULL, AV_LOG_FATAL, "Failed to initialize VideoState!\n");
+            do_exit(NULL);
+    }
+
+    event_loop(is);
+
     return 0;
 }
