@@ -9,15 +9,36 @@ CONFIG += c++17
 #DEFINES += QT_DISABLE_DEPRECATED_BEFORE=0x060000    # disables all the APIs deprecated before Qt 6.0.0
 
 SOURCES += \
-    main.cpp
+    main.c \
+    G:\code\shiftmedia\source\FFmpeg\fftools\opt_common.c \
+    G:\code\shiftmedia\source\FFmpeg\fftools\cmdutils.c
 
-HEADERS +=
+
+HEADERS += \
+    G:\code\shiftmedia\source\FFmpeg\fftools\opt_common.h \
+    G:\code\shiftmedia\source\FFmpeg\fftools\cmdutils.h \
+    G:\code\shiftmedia\source\FFmpeg\SMP\config.h
 
 win32:CONFIG(debug, debug|release) {
-    INCLUDEPATH += G:\code\shiftmedia\msvc\include
+    INCLUDEPATH += G:\code\shiftmedia\msvc\include \
+    G:\code\shiftmedia\source\FFmpeg \
+    G:\code\shiftmedia\source\FFmpeg\fftools \
+    G:\code\shiftmedia\source\FFmpeg\SMP
+
     LIBS += -LG:\code\shiftmedia\msvc\lib\x64 \
          -llibavformatd \
-         -llibavutild
+         -llibavcodecd \
+         -llibavutild \
+         -llibavdeviced \
+         -llibavfilterd \
+         -llibswresampled\
+         -llibswscaled \
+         -llibpostprocd \
+         -llibsdl2d \
+         -lAdvapi32 \
+         -lUser32 \
+         -lOleAut32 \
+         -lGdi32
 }
 
 else:win32:CONFIG(release, debug|release) {
